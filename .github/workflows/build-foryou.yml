@@ -1,0 +1,227 @@
+name: build-foryou
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+      - run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+      - name: Add ForYouStrip
+        run: |
+          cat > launcher/app/src/main/java/com/gathin/tvhome/ForYouStrip.java <<'JAVA'
+          package com.gathin.tvhome;
+          import android.content.Context;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Outline;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.AttributeSet;
+          import android.view.View;
+          import android.view.ViewOutlineProvider;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.List;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          /** For You: 4 trending TMDB posters, rotating. Display only. Off unless tmdb.key exists. */
+          public class ForYouStrip extends LinearLayout {
+              private static final int SHOWN = 4;
+              private static final int MAX = 20;
+              private static final long TURN_MS = 12000L;
+              private static final long REFRESH_MS = 6L * 60L * 60L * 1000L;
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final List<Bitmap> posters = new ArrayList<>();
+              private final ImageView[] slots = new ImageView[SHOWN];
+              private boolean loading;
+              private boolean turning;
+              private long loadedAt;
+              private int offset;
+
+              public ForYouStrip(Context c) { this(c, null); }
+
+              public ForYouStrip(Context c, AttributeSet a) {
+                  super(c, a);
+                  setOrientation(VERTICAL);
+                  setFocusable(false);
+                  setFocusableInTouchMode(false);
+                  setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+                  float d = c.getResources().getDisplayMetrics().density;
+                  final float radius = 10 * d;
+                  TextView label = new TextView(c);
+                  label.setText("FOR YOU");
+                  label.setTextColor(0xB3FFFFFF);
+                  label.setTextSize(12);
+                  label.setLetterSpacing(0.22f);
+                  addView(label);
+                  LinearLayout row = new LinearLayout(c);
+                  row.setOrientation(HORIZONTAL);
+                  LayoutParams rp = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+                  rp.topMargin = (int) (10 * d);
+                  addView(row, rp);
+                  for (int i = 0; i < SHOWN; i++) {
+                      ImageView v = new ImageView(c);
+                      v.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                      v.setBackgroundColor(0x33FFFFFF);
+                      v.setOutlineProvider(new ViewOutlineProvider() {
+                          @Override public void getOutline(View view, Outline o) {
+                              o.setRoundRect(0, 0, view.getWidth(), view.getHeight(), radius);
+                          }
+                      });
+                      v.setClipToOutline(true);
+                      LayoutParams lp = new LayoutParams((int) (96 * d), (int) (144 * d));
+                      lp.setMarginEnd((int) (10 * d));
+                      row.addView(v, lp);
+                      slots[i] = v;
+                  }
+              }
+
+              @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); start(); }
+              @Override protected void onDetachedFromWindow() { stop(); super.onDetachedFromWindow(); }
+              @Override protected void onWindowVisibilityChanged(int v) {
+                  super.onWindowVisibilityChanged(v);
+                  if (v == VISIBLE) start(); else stop();
+              }
+
+              private final Runnable turn = new Runnable() {
+                  @Override public void run() {
+                      if (!turning || posters.isEmpty()) return;
+                      offset = (offset + SHOWN) % posters.size();
+                      show(true);
+                      ui.postDelayed(this, TURN_MS);
+                  }
+              };
+
+              private void start() {
+                  if (!isAttachedToWindow() || getWindowVisibility() != VISIBLE) return;
+                  if (posters.isEmpty() || System.currentTimeMillis() - loadedAt > REFRESH_MS) load();
+                  if (!turning && !posters.isEmpty()) {
+                      turning = true;
+                      ui.postDelayed(turn, TURN_MS);
+                  }
+              }
+
+              private void stop() { turning = false; ui.removeCallbacks(turn); }
+
+              private void show(boolean fade) {
+                  if (posters.isEmpty()) return;
+                  for (int i = 0; i < SHOWN; i++) {
+                      ImageView v = slots[i];
+                      if (fade) v.setAlpha(0f);
+                      v.setImageBitmap(posters.get((offset + i) % posters.size()));
+                      if (fade) v.animate().alpha(1f).setDuration(600).start();
+                  }
+              }
+
+              private void load() {
+                  if (loading) return;
+                  File dir = getContext().getExternalFilesDir(null);
+                  if (dir == null) return;
+                  final File f = new File(dir, "tmdb.key");
+                  if (!f.exists()) return;
+                  loading = true;
+                  new Thread(() -> {
+                      final List<Bitmap> got = new ArrayList<>();
+                      try {
+                          BufferedReader r = new BufferedReader(new FileReader(f));
+                          String key = String.valueOf(r.readLine()).trim();
+                          r.close();
+                          if (key.length() > 8 && !"null".equals(key)) fetch(key, got);
+                      } catch (Exception ignored) { }
+                      ui.post(() -> {
+                          loading = false;
+                          if (got.isEmpty()) return;
+                          posters.clear();
+                          posters.addAll(got);
+                          loadedAt = System.currentTimeMillis();
+                          offset = 0;
+                          setVisibility(VISIBLE);
+                          show(false);
+                          start();
+                      });
+                  }, "foryou").start();
+              }
+
+              private HttpURLConnection open(String u) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                  c.setConnectTimeout(10000);
+                  c.setReadTimeout(10000);
+                  return c;
+              }
+
+              private void fetch(String key, List<Bitmap> out) throws Exception {
+                  String api = "https://api.themoviedb.org/3/trending/all/week";
+                  boolean bearer = key.length() > 40;
+                  HttpURLConnection c = open(bearer ? api : api + "?api_key=" + key);
+                  if (bearer) c.setRequestProperty("Authorization", "Bearer " + key);
+                  InputStream is = c.getInputStream();
+                  BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+                  StringBuilder sb = new StringBuilder();
+                  String line;
+                  while ((line = br.readLine()) != null) sb.append(line);
+                  br.close();
+                  c.disconnect();
+                  JSONArray arr = new JSONObject(sb.toString()).getJSONArray("results");
+                  for (int i = 0; i < arr.length() && out.size() < MAX; i++) {
+                      String p = arr.getJSONObject(i).optString("poster_path", "");
+                      if (p.length() < 2 || "null".equals(p)) continue;
+                      HttpURLConnection pc = open("https://image.tmdb.org/t/p/w185" + p);
+                      InputStream in = pc.getInputStream();
+                      Bitmap b = BitmapFactory.decodeStream(in);
+                      in.close();
+                      pc.disconnect();
+                      if (b != null) out.add(b);
+                  }
+              }
+          }
+          JAVA
+      - name: Patch manifest and layout
+        run: |
+          python3 - <<'PY'
+          m = 'launcher/app/src/main/AndroidManifest.xml'
+          s = open(m, encoding='utf-8').read()
+          a = '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />'
+          assert a in s
+          if 'permission.INTERNET' not in s:
+              s = s.replace(a, a + '\n    <uses-permission android:name="android.permission.INTERNET" />', 1)
+          open(m, 'w', encoding='utf-8').write(s)
+          x = 'launcher/app/src/main/res/layout/activity_main.xml'
+          t = open(x, encoding='utf-8').read()
+          view = ('    <com.gathin.tvhome.ForYouStrip\n'
+                  '        android:id="@+id/forYou"\n'
+                  '        android:layout_width="wrap_content"\n'
+                  '        android:layout_height="wrap_content"\n'
+                  '        android:layout_gravity="top|right"\n'
+                  '        android:layout_marginTop="120dp"\n'
+                  '        android:layout_marginEnd="64dp"\n'
+                  '        android:focusable="false"\n'
+                  '        android:visibility="gone" />\n')
+          i = t.rindex('</FrameLayout>')
+          open(x, 'w', encoding='utf-8').write(t[:i] + view + t[i:])
+          PY
+      - run: cd launcher && chmod +x gradlew && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foryou-apk
+          path: launcher/**/*.apk
